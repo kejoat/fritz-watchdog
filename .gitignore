@@ -1,0 +1,8 @@
+# local credentials and notes (never commit)
+.env
+*.local.*
+CLAUDE.local.md
+
+# Python
+__pycache__/
+*.pyc
