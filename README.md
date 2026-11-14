@@ -43,11 +43,18 @@ every CHECK_INTERVAL:
 
 ## Deployment on TrueNAS SCALE
 
-1. Create a dataset or folder, for example `/mnt/POOL/apps/fritz-watchdog/app`, and copy the three files from
-   [`app/`](app/) into it. The TrueNAS `apps` user (uid 568) needs read access.
-2. **Apps > Discover Apps > ⋮ > Install via YAML**: paste [`compose.yaml`](compose.yaml), adjust the volume path
-   and fill in `FRITZ_HOST`, `FRITZ_USER` and `FRITZ_PASSWORD`.
-3. Keep `DRY_RUN: "1"` for the first days and watch the app logs. When the decisions look right, set it to `"0"`.
+1. Create a folder, for example `/mnt/POOL/apps/fritz-watchdog`, with the subfolders `app` and `logs`, and copy the
+   three files from [`app/`](app/) into `app`. The container runs as the TrueNAS `apps` user (uid 568), which needs
+   **read** access to `app`, **write** access to `logs` and **traverse** on every parent folder. On datasets with
+   NFSv4 ACLs the `ls -l` mode bits don't tell; add explicit ACL entries for `apps` where needed.
+2. **Apps > Discover Apps > ⋮ > Install via YAML**: the app name may only contain lowercase letters, digits and
+   hyphens (e.g. `fritz-watchdog`). Paste [`compose.yaml`](compose.yaml), change only the **left (host) side** of the
+   volume lines (inside the container the paths stay `/app` and `/logs`) and fill in `FRITZ_HOST`, `FRITZ_USER` and
+   `FRITZ_PASSWORD`.
+3. Keep `DRY_RUN: "1"` for the first days and watch the logs. When the decisions look right, set it to `"0"`.
+
+Check that the container can reach the box (read-only):
+`docker exec <container> python /app/fritz_watchdog.py --check-box`.
 
 Plain Docker works the same way: `docker compose up -d` with the adjusted `compose.yaml`.
 
@@ -83,11 +90,16 @@ The password is stored in the app configuration, where only NAS admins can see i
 | `QUIET_WINDOWS` | – | `HH:MM-HH:MM[,…]` local time without actions, e.g. around the box's nightly forced reconnect (see the box's event log for the time); may span midnight |
 | `TZ` | UTC | Time zone for `QUIET_WINDOWS`. The alpine image has no tz database, so use a POSIX string, e.g. `CET-1CEST,M3.5.0,M10.5.0/3` |
 | `LOG_OK_EVERY` | `60` | Log an "online" line every N rounds (0 = only on changes) |
+| `LOG_DIR` | – | Folder for a rotating `fritz-watchdog.log` (in addition to stdout); empty = stdout only |
+| `LOG_MAX_BYTES` | `1000000` | Size at which the log file rotates |
+| `LOG_BACKUPS` | `5` | Rotated files to keep (`fritz-watchdog.log.1` … `.5`) |
 | `STATUS_FILE` | `/tmp/fritz-watchdog.status` | Status file for the health check |
 
 ## Logs and status
 
-One JSON object per line on stdout:
+One JSON object per line on stdout. With `LOG_DIR` set, the watchdog loop writes the same lines to
+`LOG_DIR/fritz-watchdog.log`, rotated at `LOG_MAX_BYTES` with `LOG_BACKUPS` old files. If the folder is not
+writable, it logs `log_file_disabled` and keeps running with stdout only.
 
 ```json
 {"ts": "2026-01-01T12:00:00+01:00", "level": "warning", "event": "outage", "round": 3, "box": {"service": "WANIPConnection1", "status": "Connected", "physical_link": "Up", "mobile_tech": "5G-SA"}, "probes": {"tcp:1.1.1.1:443": "FAIL TimeoutError: timed out"}}
@@ -96,7 +108,7 @@ One JSON object per line on stdout:
 
 Events: `start`, `online`, `probes_failed`, `outage`, `box_unreachable`, `waiting`, `skipped`, `reconnect`, `connect`,
 `reboot`, `dry_run`, `action`, `action_failed`, `status_after_reconnect`, `reconnect_blocked`, `reboot_blocked`,
-`no_action`, `recovered`, `config_error`.
+`no_action`, `recovered`, `config_error`, `log_file_disabled`.
 
 The container health check (`--health`) fails when the status file has not been updated for about three intervals.
 
@@ -131,6 +143,11 @@ The tests use a fake box, fake probes and a fake clock; they need no network.
 - **`box_unreachable` with a timeout**: TR-064 is disabled, the host or port is wrong, or a firewall blocks the port.
 - **`UPnP error 606`** on an action: the user lacks the right for it.
 - **Quiet windows at the wrong time**: set `TZ` as a POSIX string (see above).
+- **Container restarts at once, log says `can't open file`**: the `command` must point to `/app/fritz_watchdog.py`
+  (the path inside the container), and uid 568 must be able to read the host folder.
+- **`log_file_disabled`**: the container user cannot write to the host folder mounted at `/logs`. Docker applies
+  only the uid and gid from `user:`, not the user's supplementary groups: if write access comes from a group,
+  put that group's gid into `user: "UID:GID"`.
 
 ## Uninstall
 

@@ -18,6 +18,8 @@ Usage
   fritz_watchdog.py --health        container health check (status file fresh?)
   --dry-run                         force DRY_RUN=1 for this run
 
+Logs go to stdout; with LOG_DIR set, the loop also writes a rotating LOG_DIR/fritz-watchdog.log.
+
 Exit codes: 0 online / ok, 1 outage detected, 2 configuration error, 3 box not reachable,
 4 health check failed.
 """
@@ -28,6 +30,8 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import logging
+import logging.handlers
 import os
 import socket
 import sys
@@ -138,6 +142,9 @@ class Config:
     dry_run: bool = True
     log_ok_every: int = 60
     status_file: str = "/tmp/fritz-watchdog.status"
+    log_dir: str = ""
+    log_max_bytes: int = 1_000_000
+    log_backups: int = 5
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -163,6 +170,9 @@ class Config:
             dry_run=_bool("DRY_RUN", True),
             log_ok_every=_int("LOG_OK_EVERY", 60),
             status_file=_env("STATUS_FILE", "/tmp/fritz-watchdog.status"),
+            log_dir=_env("LOG_DIR", ""),
+            log_max_bytes=_int("LOG_MAX_BYTES", 1_000_000, 10_000),
+            log_backups=_int("LOG_BACKUPS", 5, 1),
         )
         if cfg.probe_min_ok > len(cfg.probes):
             raise ConfigError(f"PROBE_MIN_OK={cfg.probe_min_ok} is larger than the number of probes")
@@ -171,11 +181,39 @@ class Config:
 
 # ------------------------------------------------------------------------------ logging
 
+LOG_FILE_NAME = "fritz-watchdog.log"
+_file_log: logging.Logger | None = None
+
+
 def log(event: str, level: str = "info", **fields) -> None:
-    """One JSON object per line on stdout (picked up by the container log)."""
+    """One JSON object per line on stdout (container log) and, if LOG_DIR is set, in a rotating file."""
     rec = {"ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "level": level, "event": event}
     rec.update(fields)
-    print(json.dumps(rec, ensure_ascii=False, default=str), flush=True)
+    line = json.dumps(rec, ensure_ascii=False, default=str)
+    print(line, flush=True)
+    if _file_log is not None:
+        _file_log.info(line)
+
+
+def setup_file_log(cfg: "Config") -> str | None:
+    """Enable the rotating log file. Returns an error text if LOG_DIR is not usable (stdout keeps working)."""
+    global _file_log
+    if not cfg.log_dir:
+        return None
+    path = os.path.join(cfg.log_dir, LOG_FILE_NAME)
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=cfg.log_max_bytes, backupCount=cfg.log_backups, encoding="utf-8")
+    except OSError as e:
+        return f"cannot write {path}: {e.strerror or e}"
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("fritz-watchdog")
+    logger.handlers[:] = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logging.raiseExceptions = False  # a full or vanished disk must not stop the watchdog
+    _file_log = logger
+    return None
 
 
 # ------------------------------------------------------------------------------ internet probes
@@ -519,6 +557,10 @@ def main(argv: list) -> int:
         state = wd.round(fail_rounds=1)
         wd.write_status()
         return {"online": EXIT_OK, "box_unreachable": EXIT_BOX}.get(state, EXIT_OUTAGE)
+    # Only the long-running loop writes the file, so ad-hoc CLI runs never rotate it underneath.
+    problem = setup_file_log(cfg)
+    if problem:
+        log("log_file_disabled", "warning", reason=problem)
     try:
         wd.run()
     except KeyboardInterrupt:
