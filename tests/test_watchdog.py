@@ -8,8 +8,10 @@ Run: python -m unittest discover -s tests -v
 import contextlib
 import datetime as dt
 import io
+import json
 import os
 import sys
+import tempfile
 import unittest
 import urllib.error
 
@@ -202,6 +204,37 @@ class FritzBoxTests(unittest.TestCase):
             box = fw.FritzBox(client_factory=lambda e=exc: self.Client(fail=e))
             with self.assertRaises(fw.BoxError):
                 box.status()
+
+
+class FileLogTests(unittest.TestCase):
+    def tearDown(self):
+        if fw._file_log is not None:
+            for h in fw._file_log.handlers:
+                h.close()
+        fw._file_log = None
+
+    def test_writes_and_rotates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = fw.Config(log_dir=tmp, log_max_bytes=2000, log_backups=2)
+            self.assertIsNone(fw.setup_file_log(cfg))
+            for i in range(100):
+                quiet(fw.log, "online", round=i)
+            self.tearDown()
+            files = sorted(os.listdir(tmp))
+            self.assertEqual(files, ["fritz-watchdog.log", "fritz-watchdog.log.1", "fritz-watchdog.log.2"])
+            with open(os.path.join(tmp, "fritz-watchdog.log"), encoding="utf-8") as fh:
+                last = json.loads(fh.read().splitlines()[-1])
+            self.assertEqual(last["round"], 99)
+
+    def test_unusable_dir_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = fw.Config(log_dir=os.path.join(tmp, "missing"))
+            self.assertIn("cannot write", fw.setup_file_log(cfg))
+            self.assertIsNone(fw._file_log)
+
+    def test_disabled_by_default(self):
+        self.assertIsNone(fw.setup_file_log(fw.Config()))
+        self.assertIsNone(fw._file_log)
 
 
 class ConfigTests(unittest.TestCase):

@@ -1,5 +1,8 @@
 # fritz-watchdog for TrueNAS SCALE ("Apps > Discover Apps > ... > Install via YAML") or plain Docker Compose.
-# Replace /mnt/POOL/apps/fritz-watchdog with the dataset folder that holds the files from app/.
+# App name in TrueNAS: lowercase letters, digits and hyphens only (e.g. "fritz-watchdog").
+# Replace /mnt/POOL/apps/fritz-watchdog with your folder. Change only the left (host) side of the volumes;
+# inside the container the paths stay /app and /logs. The apps user (uid 568) needs read access to app/
+# (plus traverse on the parent folders) and write access to logs/.
 # Settings: see README.md. Start with DRY_RUN "1" and switch to "0" once the logs look right.
 
 services:
@@ -17,6 +20,7 @@ services:
     pids_limit: 32
     volumes:
       - /mnt/POOL/apps/fritz-watchdog/app:/app:ro
+      - /mnt/POOL/apps/fritz-watchdog/logs:/logs     # rotating log file; drop this line and LOG_DIR to disable
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       # Time zone as a POSIX TZ string (the alpine image ships no tz database). Central Europe:
@@ -32,6 +36,7 @@ services:
       ON_DISCONNECTED: "reconnect"       # box not connected: reconnect | connect | none
       REBOOT_ENABLED: "0"                # 1 = reboot the box if reconnects do not help
       QUIET_WINDOWS: ""                  # e.g. "03:20-03:35" around the box's nightly forced reconnect
+      LOG_DIR: "/logs"                   # rotating fritz-watchdog.log; "" = container log only
       # --- optional tuning (defaults shown) ---
       # CHECK_INTERVAL: "60"
       # FAIL_ROUNDS: "3"
@@ -48,6 +53,8 @@ services:
       # MAX_REBOOTS_PER_DAY: "2"
       # REBOOT_WAIT: "300"
       # LOG_OK_EVERY: "60"
+      # LOG_MAX_BYTES: "1000000"
+      # LOG_BACKUPS: "5"
     healthcheck:
       test: ["CMD", "python", "/app/fritz_watchdog.py", "--health"]
       interval: 60s
