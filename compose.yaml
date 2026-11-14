@@ -28,8 +28,10 @@ services:
       # --- FRITZ!Box access (TR-064) ---
       FRITZ_HOST: "fritz.box"            # or the box's LAN IP
       FRITZ_USER: ""
+      # Password: write "$" as "$$" and, inside '…', "'" as "''". Or leave it empty and put a line
+      # FRITZ_PASSWORD=… into app/.env instead (no escaping there; see README.md).
       FRITZ_PASSWORD: ""
-      FRITZ_TLS: "1"                     # HTTPS on the TR-064 security port (49443)
+      FRITZ_TLS: "1"                    # HTTPS on the TR-064 security port (49443)
       # --- behaviour ---
       DRY_RUN: "1"                       # 1 = only log what would happen
       ON_CONNECTED: "reconnect"          # box says "Connected" but no internet: reconnect | none

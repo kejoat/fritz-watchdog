@@ -20,15 +20,18 @@ import fritz_watchdog as fw  # noqa: E402
 
 
 class FakeBox:
-    def __init__(self, status="Connected", reachable=True, status_after=None):
+    def __init__(self, status="Connected", reachable=True, status_after=None, auth_ok=True):
         self.status_value = status
         self.status_after = status_after  # status reported after ForceTermination
         self.reachable = reachable
+        self.auth_ok = auth_ok
         self.calls = []
 
     def status(self):
         if not self.reachable:
             raise fw.BoxError("unreachable")
+        if not self.auth_ok:
+            raise fw.BoxAuthError("HTTP 401 Unauthorized")
         return {"service": "WANIPConnection1", "status": self.status_value}
 
     def action(self, service, action):
@@ -107,6 +110,27 @@ class WatchdogTests(unittest.TestCase):
         wd, _, _ = make(box=FakeBox(reachable=False))
         self.assertEqual(self.rounds(wd, 4)[-1], "box_unreachable")
         self.assertEqual(wd.box.calls, [])
+
+    def test_refused_login_is_reported_as_such(self):
+        wd, _, _ = make(box=FakeBox(auth_ok=False))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            states = [wd.round() for _ in range(4)]
+        self.assertEqual(states[-1], "box_auth_failed")
+        self.assertEqual(wd.box.calls, [])
+        events = [json.loads(line)["event"] for line in out.getvalue().splitlines()]
+        self.assertIn("box_auth_failed", events)
+        self.assertNotIn("box_unreachable", events)
+
+    def test_startup_check_logs_box_state(self):
+        for box, event in ((FakeBox(), "box_ok"), (FakeBox(auth_ok=False), "box_auth_failed"),
+                           (FakeBox(reachable=False), "box_unreachable")):
+            wd, _, _ = make(box=box)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                wd.check_box()
+            self.assertEqual(json.loads(out.getvalue())["event"], event)
+            self.assertEqual(box.calls, [])
 
     def test_dry_run_never_calls_the_box(self):
         wd, clock, _ = make(reboot_enabled=True)
@@ -204,6 +228,24 @@ class FritzBoxTests(unittest.TestCase):
             box = fw.FritzBox(client_factory=lambda e=exc: self.Client(fail=e))
             with self.assertRaises(fw.BoxError):
                 box.status()
+
+    def test_refused_login_becomes_box_auth_error(self):
+        for code in (401, 403, 503):
+            exc = urllib.error.HTTPError("https://box", code, "denied", None, None)
+            box = fw.FritzBox(client_factory=lambda e=exc: self.Client(fail=e))
+            with self.assertRaises(fw.BoxAuthError):
+                box.status()
+        exc = urllib.error.HTTPError("https://box", 404, "not found", None, None)
+        box = fw.FritzBox(client_factory=lambda: self.Client(fail=exc))
+        with self.assertRaises(fw.BoxError) as ctx:
+            box.status()
+        self.assertNotIsInstance(ctx.exception, fw.BoxAuthError)
+
+    def test_upnp_606_becomes_box_auth_error(self):
+        client = self.Client()
+        client.call = lambda service, action: {"error": True, "errorCode": 606, "errorDescription": "Action Not Authorized"}
+        with self.assertRaises(fw.BoxAuthError):
+            fw.FritzBox("WANIPConnection1", client_factory=lambda: client).status()
 
 
 class FileLogTests(unittest.TestCase):

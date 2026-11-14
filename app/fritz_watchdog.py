@@ -20,8 +20,8 @@ Usage
 
 Logs go to stdout; with LOG_DIR set, the loop also writes a rotating LOG_DIR/fritz-watchdog.log.
 
-Exit codes: 0 online / ok, 1 outage detected, 2 configuration error, 3 box not reachable,
-4 health check failed.
+Exit codes: 0 online / ok, 1 outage detected, 2 configuration error, 3 box not reachable or login
+refused, 4 health check failed.
 """
 
 from __future__ import annotations
@@ -254,8 +254,18 @@ class BoxError(Exception):
     pass
 
 
+class BoxAuthError(BoxError):
+    """The box answered but refused the login or the action (wrong credentials, missing right, auth lockout)."""
+
+
+AUTH_HTTP_CODES = (401, 403, 503)  # 503 = too many failed logins, the box blocks for a while
+AUTH_UPNP_CODES = (606,)           # 606 = action not authorized for this user
+AUTH_HINT = "the box refused the login: check FRITZ_USER/FRITZ_PASSWORD and the user's rights"
+
+
 class FritzBox:
-    """Thin wrapper around Tr064: auto-detects the WAN service, turns every failure into BoxError."""
+    """Thin wrapper around Tr064: auto-detects the WAN service, turns every failure into BoxError
+    (BoxAuthError when the box answered but refused the credentials or the right)."""
 
     def __init__(self, wan_service: str = "auto", client_factory=Tr064):
         self.wan_service = wan_service
@@ -270,11 +280,13 @@ class FritzBox:
         except SystemExit:  # fc.die(): unknown service on this model/firmware
             raise BoxError(f"service {service} not available") from None
         except urllib.error.HTTPError as e:
-            raise BoxError(f"{service}.{action}: HTTP {e.code} {e.reason}") from None
+            cls = BoxAuthError if e.code in AUTH_HTTP_CODES else BoxError
+            raise cls(f"{service}.{action}: HTTP {e.code} {e.reason}") from None
         except (urllib.error.URLError, OSError, ET.ParseError) as e:
             raise BoxError(f"{service}.{action}: {getattr(e, 'reason', e)}") from None
         if res.get("error"):
-            raise BoxError(f"{service}.{action}: UPnP error {res.get('errorCode')} {res.get('errorDescription')}")
+            cls = BoxAuthError if res.get("errorCode") in AUTH_UPNP_CODES else BoxError
+            raise cls(f"{service}.{action}: UPnP error {res.get('errorCode')} {res.get('errorDescription')}")
         return res
 
     def detect_wan_service(self) -> str:
@@ -378,7 +390,7 @@ class Watchdog:
 
     # -- one round
     def round(self, fail_rounds: int | None = None) -> str:
-        """Run one check. Returns online | degraded | outage | box_unreachable."""
+        """Run one check. Returns online | degraded | outage | box_auth_failed | box_unreachable."""
         self.rounds += 1
         ok, results = self.probe()
         if ok:
@@ -400,6 +412,10 @@ class Watchdog:
 
         try:
             box = self.box.status()
+        except BoxAuthError as e:
+            log("box_auth_failed", "error", reason=str(e), probes=results, note=AUTH_HINT + "; no action")
+            self.state = "box_auth_failed"
+            return self.state
         except BoxError as e:
             log("box_unreachable", "error", reason=str(e), probes=results,
                 note="no internet and no answer from the box: LAN/box problem, no action")
@@ -483,8 +499,18 @@ class Watchdog:
         self._do("DeviceConfig1", "Reboot")
 
     # -- loop
+    def check_box(self) -> None:
+        """Ask the box once at startup, so wrong credentials show up now and not only during an outage."""
+        try:
+            log("box_ok", box=self.box.status())
+        except BoxAuthError as e:
+            log("box_auth_failed", "error", reason=str(e), note=AUTH_HINT)
+        except BoxError as e:
+            log("box_unreachable", "warning", reason=str(e), note="asked again when an outage is detected")
+
     def run(self) -> None:
         log("start", config=redacted_config(self.cfg))
+        self.check_box()
         while True:
             started = self.clock()
             try:
@@ -548,6 +574,9 @@ def main(argv: list) -> int:
         try:
             print(json.dumps(box.status(), indent=2, ensure_ascii=False))
             return EXIT_OK
+        except BoxAuthError as e:
+            log("box_auth_failed", "error", reason=str(e), note=AUTH_HINT)
+            return EXIT_BOX
         except BoxError as e:
             log("box_unreachable", "error", reason=str(e))
             return EXIT_BOX
@@ -556,7 +585,7 @@ def main(argv: list) -> int:
     if args.once:
         state = wd.round(fail_rounds=1)
         wd.write_status()
-        return {"online": EXIT_OK, "box_unreachable": EXIT_BOX}.get(state, EXIT_OUTAGE)
+        return {"online": EXIT_OK, "box_unreachable": EXIT_BOX, "box_auth_failed": EXIT_BOX}.get(state, EXIT_OUTAGE)
     # Only the long-running loop writes the file, so ad-hoc CLI runs never rotate it underneath.
     problem = setup_file_log(cfg)
     if problem:

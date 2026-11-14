@@ -33,32 +33,209 @@ every CHECK_INTERVAL:
 - After an action, the watchdog waits `RECOVERY_WAIT` seconds before it acts again, and `REBOOT_WAIT` seconds after a reboot.
 - Counters (cooldowns, daily limits) live in memory. Restarting the container resets them.
 
-## Requirements on the FRITZ!Box
+## Before you start
 
-1. **Home Network > Network > Network Settings**: enable *Allow access for applications* (TR-064).
-2. **System > FRITZ!Box Users**: create a dedicated user for the watchdog with only the right
-   *FRITZ!Box Settings*, which reconnect and reboot need. Use a long random password.
-3. The host running the container must reach the box on TCP **49443** (TR-064 over HTTPS, `FRITZ_TLS=1`)
-   or 49000 (plain HTTP). Open it in any firewall in between.
+You need three things. Each takes a minute.
 
-## Deployment on TrueNAS SCALE
+**1. Allow TR-064 on the FRITZ!Box.**
+Open the box's web UI and go to **Home Network › Network › Network Settings**. Turn on
+**Allow access for applications** and click **Apply**.
 
-1. Create a folder, for example `/mnt/POOL/apps/fritz-watchdog`, with the subfolders `app` and `logs`, and copy the
-   three files from [`app/`](app/) into `app`. The container runs as the TrueNAS `apps` user (uid 568), which needs
-   **read** access to `app`, **write** access to `logs` and **traverse** on every parent folder. On datasets with
-   NFSv4 ACLs the `ls -l` mode bits don't tell; add explicit ACL entries for `apps` where needed.
-2. **Apps > Discover Apps > ⋮ > Install via YAML**: the app name may only contain lowercase letters, digits and
-   hyphens (e.g. `fritz-watchdog`). Paste [`compose.yaml`](compose.yaml), change only the **left (host) side** of the
-   volume lines (inside the container the paths stay `/app` and `/logs`) and fill in `FRITZ_HOST`, `FRITZ_USER` and
-   `FRITZ_PASSWORD`.
-3. Keep `DRY_RUN: "1"` for the first days and watch the logs. When the decisions look right, set it to `"0"`.
+**2. Create a user for the watchdog on the FRITZ!Box.**
+Go to **System › FRITZ!Box Users › Add User**. Pick a name (e.g. `watchdog`) and a long random password.
+Under rights, tick only **FRITZ!Box Settings**: reconnect and reboot need this right, nothing else does.
+Write the name and password down; you need them in step 4 of the how-to.
 
-Check that the container can reach the box (read-only):
-`docker exec <container> python /app/fritz_watchdog.py --check-box`.
+**3. Know the box's address.**
+Usually `fritz.box` or `192.168.178.1`. If your server does not use the box as its DNS server, use the IP.
+The server must reach the box on TCP port **49443** (TR-064 over HTTPS). Open that port in any firewall
+between the two. In a normal home network with just the box, there is nothing to do.
 
-Plain Docker works the same way: `docker compose up -d` with the adjusted `compose.yaml`.
+### Where should the password go?
 
-The password is stored in the app configuration, where only NAS admins can see it. It never appears in the logs.
+Pick one of the two ways. Both keep the password out of the logs.
+
+| | **A. In the app settings** (`FRITZ_PASSWORD`) | **B. In a file `app/.env`** |
+| --- | --- | --- |
+| Good for | passwords without `$` and `'` | any password, and people who'd rather not think about escaping |
+| How | type it into the YAML | one line `FRITZ_PASSWORD=…` in a text file |
+| Watch out | Compose treats `$` specially, even inside quotes: write every `$` as `$$`. Inside `'…'` write `'` as `''`. A wrong character means HTTP 401 later. | Leave `FRITZ_PASSWORD` in the YAML empty (a set value wins over the file). Don't delete the file when you update the scripts. |
+
+If unsure, use **B**. The how-tos below show both.
+
+## How-to: TrueNAS SCALE (custom app)
+
+Everything below happens in the TrueNAS web UI and its shell (**System › Shell**). Replace `POOL` with the name
+of your pool (see **Storage**).
+
+**1. Create the folders.**
+
+```sh
+sudo mkdir -p /mnt/POOL/apps/fritz-watchdog/app /mnt/POOL/apps/fritz-watchdog/logs
+```
+
+**2. Download the three script files.**
+
+```sh
+cd /mnt/POOL/apps/fritz-watchdog/app
+for f in fritz_watchdog.py tr064.py fritz_common.py; do
+  sudo curl -fsSLO "https://raw.githubusercontent.com/kejoat/fritz-watchdog/main/app/$f"
+done
+ls -l
+```
+
+You should see the three `.py` files.
+
+**3. Hand the folder to the container user.** The container runs as the TrueNAS `apps` user (uid/gid 568).
+It must read `app/` and write `logs/`.
+
+```sh
+sudo chown -R 568:568 /mnt/POOL/apps/fritz-watchdog
+```
+
+> If the pool uses NFSv4 ACLs (shares for Windows/SMB usually do), add the `apps` user instead in
+> **Datasets › your dataset › Permissions › Edit**: read on `app`, modify on `logs`, and traverse on every
+> parent folder. See [Troubleshooting](#troubleshooting) if the container cannot read or write.
+
+**4. Only for password way B: create the password file.**
+
+```sh
+sudo nano /mnt/POOL/apps/fritz-watchdog/app/.env
+```
+
+Type one line, with your password after the `=` (no quotes, no spaces):
+
+```text
+FRITZ_PASSWORD=your-long-random-password
+```
+
+Save with **Ctrl+O**, **Enter**, then quit with **Ctrl+X**. Make it readable for the container only:
+
+```sh
+sudo chown 568:568 /mnt/POOL/apps/fritz-watchdog/app/.env
+sudo chmod 600 /mnt/POOL/apps/fritz-watchdog/app/.env
+```
+
+**5. Install the app.**
+
+1. Go to **Apps › Discover Apps**, click the **⋮** menu (top right) and choose **Install via YAML**.
+2. **Name**: lowercase letters, digits and hyphens only, e.g. `fritz-watchdog`.
+3. Open [`compose.yaml`](compose.yaml) from this repository (the raw file), copy everything and paste it.
+   Copy from the file itself: text copied from a chat or a web page can contain invisible characters, and
+   TrueNAS then says *"Invalid YAML provided"*.
+4. Change these lines:
+
+   ```yaml
+   volumes:
+     - /mnt/POOL/apps/fritz-watchdog/app:/app:ro     # only the part before the first ":"
+     - /mnt/POOL/apps/fritz-watchdog/logs:/logs
+   environment:
+     FRITZ_HOST: "192.168.178.1"                     # your box
+     FRITZ_USER: "watchdog"                          # the user from "Before you start"
+     FRITZ_PASSWORD: ""                              # way B: leave empty; way A: the password ($ → $$)
+   ```
+
+   Leave `DRY_RUN: "1"` for now: the watchdog then only *logs* what it would do.
+5. Click **Save**. After a few seconds the app shows **Running**.
+
+**6. Check that it works.** Click the app, then **Logs** (or use the shell, see [Check and go live](#check-and-go-live)).
+The first lines should be `start` and then **`box_ok`**. That means the container reached the box and the
+login worked. Seeing `box_auth_failed` or `box_unreachable` instead? See [Troubleshooting](#troubleshooting).
+
+Continue with [Check and go live](#check-and-go-live). The container name for shell commands is
+`ix-<app name>-fritz-watchdog-1`, e.g. `ix-fritz-watchdog-fritz-watchdog-1` (list them with `sudo docker ps`).
+
+## How-to: Docker Compose (any Linux host)
+
+You need Docker with the Compose plugin (`docker compose version` prints a version).
+
+**1. Create a folder and download the files.**
+
+```sh
+mkdir -p ~/fritz-watchdog/app ~/fritz-watchdog/logs
+cd ~/fritz-watchdog
+curl -fsSLO https://raw.githubusercontent.com/kejoat/fritz-watchdog/main/compose.yaml
+for f in fritz_watchdog.py tr064.py fritz_common.py; do
+  curl -fsSL -o "app/$f" "https://raw.githubusercontent.com/kejoat/fritz-watchdog/main/app/$f"
+done
+```
+
+**2. Only for password way B: create the password file** (in `app/`, not next to `compose.yaml`):
+
+```sh
+nano app/.env            # one line: FRITZ_PASSWORD=your-long-random-password
+chmod 600 app/.env
+```
+
+**3. Edit `compose.yaml`** (`nano compose.yaml`):
+
+```yaml
+user: "1000:1000"                  # your own ids, see the output of: id -u; id -g
+volumes:
+  - ./app:/app:ro
+  - ./logs:/logs
+environment:
+  FRITZ_HOST: "192.168.178.1"
+  FRITZ_USER: "watchdog"
+  FRITZ_PASSWORD: ""               # way B: leave empty; way A: the password ($ → $$)
+```
+
+With your own uid/gid the container can read `app/` (and `.env`) and write `logs/` without any extra rights.
+
+**4. Start it.**
+
+```sh
+docker compose up -d
+docker compose logs -f             # Ctrl+C stops watching, not the container
+```
+
+Look for **`box_ok`** right after `start`. Continue with [Check and go live](#check-and-go-live); in the commands
+there, use `docker compose exec fritz-watchdog` instead of `docker exec <container>`.
+
+## Check and go live
+
+**Login and box status** (read-only, changes nothing):
+
+```sh
+docker exec <container> python /app/fritz_watchdog.py --check-box
+```
+
+Expected: JSON with `"status": "Connected"`.
+
+**Rehearse an outage safely.** This lets one check fail on purpose and shows what the watchdog *would* do.
+Nothing is sent to the box:
+
+```sh
+docker exec <container> sh -c 'PROBES=tcp:192.0.2.1:443 python /app/fritz_watchdog.py --once --dry-run'
+```
+
+Expected: an `outage` line and a `dry_run` line with `"would_call": "WANIPConnection1.ForceTermination"`
+(or `WANPPPConnection1` on DSL).
+
+**Go live.** Watch the logs for a few days. When the decisions look right, set `DRY_RUN: "0"`:
+on TrueNAS via **Apps › your app › Edit**, with Compose in `compose.yaml` followed by `docker compose up -d`.
+
+Optional settings worth a look: `QUIET_WINDOWS` (skip the box's nightly forced reconnect) and `REBOOT_ENABLED`.
+All settings are in the [table below](#settings-environment-variables).
+
+### Updating
+
+Download the three `.py` files again (step 2 of your how-to) and restart the app (TrueNAS: **Stop**/**Start**;
+Compose: `docker compose restart`). Overwrite the files; don't empty the `app/` folder, or `.env` goes with it.
+
+### Checking the password without showing it
+
+If the box answers HTTP 401 although the password looks right, compare what the container got with what you
+meant, by length and a short hash:
+
+```sh
+# inside the container (password way A only)
+docker exec <container> python -c "import os,hashlib;p=os.environ['FRITZ_PASSWORD'];print(len(p),hashlib.sha256(p.encode()).hexdigest()[:8])"
+# on your PC (asks for the password, shows nothing)
+python -c "import getpass,hashlib;p=getpass.getpass();print(len(p),hashlib.sha256(p.encode()).hexdigest()[:8])"
+```
+
+Different results mean the password was changed on the way, usually by a `$`. Use `$$`, or switch to way B.
 
 ## Settings (environment variables)
 
@@ -106,9 +283,9 @@ writable, it logs `log_file_disabled` and keeps running with stdout only.
 {"ts": "2026-01-01T12:00:00+01:00", "level": "warning", "event": "reconnect", "attempt": 1, "service": "WANIPConnection1", "dry_run": false}
 ```
 
-Events: `start`, `online`, `probes_failed`, `outage`, `box_unreachable`, `waiting`, `skipped`, `reconnect`, `connect`,
-`reboot`, `dry_run`, `action`, `action_failed`, `status_after_reconnect`, `reconnect_blocked`, `reboot_blocked`,
-`no_action`, `recovered`, `config_error`, `log_file_disabled`.
+Events: `start`, `box_ok`, `online`, `probes_failed`, `outage`, `box_auth_failed`, `box_unreachable`, `waiting`,
+`skipped`, `reconnect`, `connect`, `reboot`, `dry_run`, `action`, `action_failed`, `status_after_reconnect`,
+`reconnect_blocked`, `reboot_blocked`, `no_action`, `recovered`, `config_error`, `log_file_disabled`.
 
 The container health check (`--health`) fails when the status file has not been updated for about three intervals.
 
@@ -123,7 +300,7 @@ python app/fritz_watchdog.py --health        health check
                              --dry-run       force DRY_RUN=1
 ```
 
-Exit codes: `0` online/ok, `1` outage detected, `2` configuration error, `3` box not reachable, `4` unhealthy.
+Exit codes: `0` online/ok, `1` outage detected, `2` configuration error, `3` box not reachable or login refused, `4` unhealthy.
 
 For local tests, copy [`.env.example`](.env.example) to `.env` and fill it in. Only the `FRITZ_*` keys are read from that file.
 A safe way to simulate an outage: `PROBES=tcp:192.0.2.1:443 python app/fritz_watchdog.py --once --dry-run`.
@@ -139,7 +316,9 @@ The tests use a fake box, fake probes and a fake clock; they need no network.
 
 ## Troubleshooting
 
-- **`box_unreachable` with HTTP 401**: wrong user or password, or the user lacks the *FRITZ!Box Settings* right.
+- **`box_auth_failed`** (HTTP 401/403, UPnP 606): wrong user or password, or the user lacks the *FRITZ!Box Settings*
+  right. A password set in the app configuration may have been changed by Compose (see [The password](#the-password)).
+  HTTP 503 means the box blocks logins for a while after too many failures: fix the password, then wait.
 - **`box_unreachable` with a timeout**: TR-064 is disabled, the host or port is wrong, or a firewall blocks the port.
 - **`UPnP error 606`** on an action: the user lacks the right for it.
 - **Quiet windows at the wrong time**: set `TZ` as a POSIX string (see above).
@@ -148,6 +327,9 @@ The tests use a fake box, fake probes and a fake clock; they need no network.
 - **`log_file_disabled`**: the container user cannot write to the host folder mounted at `/logs`. Docker applies
   only the uid and gid from `user:`, not the user's supplementary groups: if write access comes from a group,
   put that group's gid into `user: "UID:GID"`.
+- **Checking read access inside the container**: the alpine `test -r` judges by the mode bits and ignores NFSv4 ACLs,
+  so it can report a readable file as unreadable. Really open it instead:
+  `docker exec <container> python -c "open('/app/.env').read()"`.
 
 ## Uninstall
 
